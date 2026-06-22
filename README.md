@@ -20,7 +20,7 @@ A custom server for S Voice that makes it work again locally. Works with S Voice
 
 ## How it works
 
-It works by redirecting requests sent from S Voice to a local server. The server then decodes the audio and uses OpenAI Whisper to transcribe it and passes it to an LLM. The LLM then chooses whether to respond with plain text or an action such as setting a timer, opening an app, etc.
+It works by redirecting requests sent from S Voice to a local server. The server then decodes the audio and uses standard speech-to-text libraries to transcribe it and passes it to an if-else chain. The chain then chooses whether to respond with plain text information or an action such as setting a timer, opening an app, etc.
 
 The current supported actions are opening apps, setting timers, toggling bt/wifi, starting voice recordings, searching the web, and controlling music.
 
@@ -28,35 +28,21 @@ The current supported actions are opening apps, setting timers, toggling bt/wifi
 
 ### Prerequesites
 
-- New-ish Python version (3.13.5 tested)
-- Ollama (`brew install --cask ollama-app`)
+- New-ish Python version (3.13.5 tested)
 - mitmproxy (`brew install mitmproxy`)
-- ffmpeg in path (`brew install ffmpeg`)
-- Ollama model - I use qwen3:4b instruct as it runs good on my laptop (`ollama pull qwen3:4b-instruct-2507-q4_K_M`, about 2.5GB)
-- Decent CPU or GPU and enough RAM to load the LLM and Whisper model.
+- ffmpeg in path (`brew install ffmpeg`)
 - Wi-Fi on the phone
   
 ### Configure the server
 
 Open `config.json` and update the settings:
-
-API Configuration:
-- `api.provider`: Choose "ollama" or "openai" for your LLM backend
-- `api.ollama.base_url`: Ollama server URL (default: http://localhost:11434)
-- `api.openai.base_url`: OpenAI-compatible API endpoint (e.g., http://localhost:8000/v1)
-- `api.openai.api_key`: API key for OpenAI-compatible services
-
+
 Server Configuration:
 - `server.host`: Your local IP address for redirects (find with `ifconfig`, `ip addr`, or `ipconfig`)
 - `server.bind`: Address to bind the server to (default: "0.0.0.0" to accept connections from any interface)
-- `server.port`: Server port (default 5067)
-- `models.llm`: Your model name (e.g., `qwen3:4b-instruct-2507-q4_K_M` for Ollama)
-- `models.whisper`: Whisper model size (tiny/base/small/medium/large)
+- `server.port`: Server port (default 5067)
 
-Options:
-- `options.whisper_language`: Language code for transcription ("en", "es", "fr", etc)
-- `options.max_history_messages`: Number of messages to keep in conversation memory
-- `options.conversation_timeout_minutes`: Auto-cleanup inactive conversations
+Options:
 - `options.keep_audio_files`: Set to true to keep audio files
 - `options.ffmpeg_path`: Path to ffmpeg binary (default: "ffmpeg" - uses system PATH)
 
@@ -96,7 +82,6 @@ Now we need to set up the S Voice server itself
 
 ### Start the server
 
-- Type `python main.py` to start the server
-- The first start may take a while as it needs to download and load the Whisper model
+- Type `python main.py` to start the server
 - If everything is set up correctly, you should see `Application startup complete.`
 - Visit http://localhost:5067/dash (or your configured port) to access the dashboard
