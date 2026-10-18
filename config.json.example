@@ -1,28 +1,16 @@
 {
-  "api": {
-    "provider": "ollama",
-    "ollama": {
-      "base_url": "http://localhost:11434"
-    },
-    "openai": {
-      "base_url": "http://localhost:8000/v1",
-      "api_key": "your-api-key-here"
-    }
-  },
-  "models": {
-    "llm": "qwen3:4b-instruct-2507-q4_K_M",
-    "whisper": "small"
+  "speech": {
+    "vosk_model_path": "models/vosk-model-small-en-us-0.15"
   },
   "server": {
-    "host": "192.168.1.50",
+    "host": "192.168.1.10",
     "bind": "0.0.0.0",
     "port": 5067
   },
   "options": {
     "max_history_messages": 18,
     "keep_audio_files": false,
-    "whisper_language": "en",
     "conversation_timeout_minutes": 30,
-    "ffmpeg_path": "ffmpeg"
+    "ffmpeg_path": "path/to/ffmpeg/ffmpeg.exe"
   }
 }

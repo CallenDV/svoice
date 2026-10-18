@@ -5,6 +5,7 @@ dist/
 wheels/
 *.egg-info
 .DS_Store
+models
 .venv
 S-Voice.apk_Decompiler.com/
 voice_talk_U1.apk_Decompiler.com/
