@@ -9,6 +9,7 @@ import time
 import wave
 import tempfile
 import threading
+import random
 
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -299,6 +300,134 @@ def extract_command_argument(text: str, patterns: list) -> str | None:
             return match.group(1).strip(" .,!?'\"")
     return None
 
+PLEASANTRY_RESPONSES = {
+    "how_are_you": [
+        "I'm doing great, thanks for asking!",
+        "I'm feeling fantastic and ready to assist!",
+        "All systems are running smoothly. How are you?",
+        "I'm doing well! It's always nice to hear from you.",
+        "Couldn't be better!",
+        "I'm here, alert, and ready to help. Thanks for asking!",
+        "Pretty good! Just waiting for your next command.",
+        "I'm doing fine. I hope you're having a wonderful day!",
+    ],
+    "whats_up": [
+        "Not much! Just standing by to help you out.",
+        "I'm all ears! What's up?",
+        "Just hanging out in your device, ready when you need me.",
+        "Everything's running smoothly.",
+        "The usual: listening, learning, and ready to assist!",
+    ],
+    "greeting": [
+        "Hello! It's great to hear from you.",
+        "Hey there!",
+        "Hi!",
+        "Hello again! Need any help?",
+        "Hey! Your personal assistant is at your service.",
+    ],
+    "thanks": [
+        "You're very welcome!",
+        "Anytime! That's what I'm here for.",
+        "Happy to help!",
+        "You're welcome!",
+        "My pleasure!",
+        "No problem at all!",
+    ],
+    "compliment": [
+        "Aw, thank you! You're pretty great yourself.",
+        "That's very kind of you to say!",
+        "I'll take that as a five-star review!",
+        "Thanks! I'll do my best to keep impressing you.",
+        "You're making me blush!",
+    ],
+    "apology": [
+        "No worries at all!",
+        "It's completely okay. Don't worry about it.",
+        "No apology needed! We're good.",
+        "That's alright. How can I help?",
+    ],
+    "goodbye": [
+        "Goodbye! Take care of yourself.",
+        "See you later! I'll be here when you need me.",
+        "Until next time!",
+        "Take care, and have a wonderful day!",
+        "Signing off for now. See you soon!",
+    ],
+    "good_night": [
+        "Good night! Sleep well.",
+        "Sweet dreams! I'll be here tomorrow.",
+        "Rest up and have a peaceful night.",
+        "Good night! I hope tomorrow is a great day for you.",
+    ],
+    "identity": [
+        "I'm S Voice, your personal voice assistant. How can I help?",
+        "You can call me S Voice! I'm here to make things easier.",
+        "I'm your voice assistant, ready to help with everyday tasks.",
+    ],
+    "capabilities": [
+        "I can open apps, set timers, change supported settings, "
+        "control music, search the web, and share interesting facts.",
+        "Try asking me to set a timer, play music, open an app, "
+        "or tell you a random fact.",
+        "I'm here to help with commands, music, timers, web searches, "
+        "and a little conversation too!",
+    ],
+    "affirmative": [
+        "Of course!",
+        "Absolutely! What do you have in mind?",
+        "You bet!",
+        "Sure thing!",
+    ],
+}
+
+TRIVIA_FACTS = [
+    "Octopuses have three hearts, and two of them help pump blood "
+    "through the gills.",
+    "A day on Venus is longer than a year on Venus.",
+    "Honey can remain edible for a very long time when properly "
+    "sealed and stored.",
+    "Wombats produce cube-shaped droppings.",
+    "The Eiffel Tower can become slightly taller in hot weather "
+    "because metal expands when heated.",
+    "Bananas are berries botanically, but strawberries are not "
+    "true berries.",
+    "Sharks existed before trees appeared on Earth.",
+    "The fingerprints of a koala are remarkably similar to those "
+    "of humans.",
+    "Lightning can heat the air around it to temperatures hotter "
+    "than the surface of the Sun.",
+    "An adult human skeleton typically has 206 bones.",
+    "Some turtles can absorb oxygen through specialized tissues "
+    "near their tails while underwater.",
+    "The Moon is slowly moving away from Earth by a few centimeters "
+    "each year.",
+    "A group of flamingos is commonly called a flamboyance.",
+    "Sound travels faster through water than through air.",
+    "The shortest war in recorded history is commonly identified "
+    "as the Anglo-Zanzibar War of 1896, which lasted less than "
+    "an hour.",
+    "Saturn's average density is lower than that of liquid water.",
+    "There are more possible arrangements of a shuffled deck of "
+    "52 cards than there are atoms in many everyday objects.",
+    "The heart of a blue whale is enormous and can weigh hundreds "
+    "of kilograms.",
+    "Some fungi can glow in the dark through a process called "
+    "bioluminescence.",
+    "A cloud can weigh hundreds of tonnes, even though it floats "
+    "because its water droplets are spread through a large volume "
+    "of air.",
+]
+
+TRIVIA_INTROS = [
+    "Here's a fun fact:",
+    "Did you know?",
+    "Here's a little piece of trivia for you:",
+    "Ready for something interesting?",
+    "Here's a fact you might enjoy:",
+    "Your random fact of the moment is:",
+    "Here's something fascinating:",
+    "Fun fact incoming!",
+]
 
 def recognize_command(text: str) -> dict:
     """
@@ -438,6 +567,155 @@ def recognize_command(text: str) -> dict:
 
     if re.search(r"\b(?:sing|singing)\b", normalized):
         return {"action": "chatbot_sing"}
+    
+    if re.search(
+        r"\b(?:trivia|fun fact|random fact|interesting fact|"
+        r"did you know|surprise me|something interesting)\b",
+        normalized,
+    ):
+        return {
+            "action": "fixed",
+            "response": (
+                f"{random.choice(TRIVIA_INTROS)} "
+                f"{random.choice(TRIVIA_FACTS)}"
+            ),
+        }
+
+    if re.fullmatch(
+        r"(?:"
+        r"how are you(?: doing)?"
+        r"|how have you been"
+        r"|how are things"
+        r"|how is it going"
+        r"|how's it going"
+        r"|hows it going"
+        r"|are you doing (?:okay|ok|well|good|fine)"
+        r"|are you alright"
+        r"|are you all right"
+        r"|are you having a good day"
+        r"|how do you feel"
+        r")[?.!, ]*",
+        normalized,
+    ):
+        return {
+            "action": "fixed",
+            "response": random.choice(
+                PLEASANTRY_RESPONSES["how_are_you"]
+            ),
+        }
+
+    if re.fullmatch(
+        r"(?:what's up|whats up|what is up|"
+        r"what's happening|whats happening|"
+        r"how's everything|hows everything|"
+        r"what are you up to)[?.!, ]*",
+        normalized,
+    ):
+        return {
+            "action": "fixed",
+            "response": random.choice(
+                PLEASANTRY_RESPONSES["whats_up"]
+            ),
+        }
+
+    if re.fullmatch(
+        r"(?:"
+        r"who are you"
+        r"|what are you"
+        r"|what is your name"
+        r"|what's your name"
+        r"|whats your name"
+        r"|do you know who you are"
+        r")[?.!, ]*",
+        normalized,
+    ):
+        return {
+            "action": "fixed",
+            "response": random.choice(
+                PLEASANTRY_RESPONSES["identity"]
+            ),
+        }
+
+    if re.fullmatch(
+        r"(?:"
+        r"what can you do"
+        r"|what can you help me with"
+        r"|what are your features"
+        r"|how can you help me"
+        r"|what commands do you know"
+        r")[?.!, ]*",
+        normalized,
+    ):
+        return {
+            "action": "fixed",
+            "response": random.choice(
+                PLEASANTRY_RESPONSES["capabilities"]
+            ),
+        }
+
+    if re.fullmatch(
+        r"(?:"
+        r"you're awesome|youre awesome"
+        r"|you are awesome"
+        r"|you're amazing|youre amazing"
+        r"|you are amazing"
+        r"|you're great|youre great"
+        r"|you are great"
+        r"|you're the best|youre the best"
+        r"|you are the best"
+        r"|good job"
+        r"|well done"
+        r"|i like you"
+        r")[!. ]*",
+        normalized,
+    ):
+        return {
+            "action": "fixed",
+            "response": random.choice(
+                PLEASANTRY_RESPONSES["compliment"]
+            ),
+        }
+
+    if re.fullmatch(
+        r"(?:"
+        r"sorry"
+        r"|i'm sorry|im sorry"
+        r"|my apologies"
+        r"|i apologize"
+        r")[!. ]*",
+        normalized,
+    ):
+        return {
+            "action": "fixed",
+            "response": random.choice(
+                PLEASANTRY_RESPONSES["apology"]
+            ),
+        }
+
+    if re.fullmatch(
+        r"(?:good night|goodnight|nighty night|"
+        r"sleep well|sweet dreams)[!. ]*",
+        normalized,
+    ):
+        return {
+            "action": "fixed",
+            "response": random.choice(
+                PLEASANTRY_RESPONSES["good_night"]
+            ),
+        }
+
+    if re.fullmatch(
+        r"(?:goodbye|good bye|bye|bye bye|"
+        r"see you|see you later|talk to you later|"
+        r"catch you later|take care)[!. ]*",
+        normalized,
+    ):
+        return {
+            "action": "fixed",
+            "response": random.choice(
+                PLEASANTRY_RESPONSES["goodbye"]
+            ),
+        }
 
     if re.fullmatch(
         r"(?:hi|hello|hey|good morning|good afternoon|good evening)[!. ]*",
