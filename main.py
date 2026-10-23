@@ -10,18 +10,27 @@ import wave
 import tempfile
 import threading
 import random
+import html
+import ipaddress
 
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import unquote, urlsplit
 from collections import deque
+from pathlib import Path
 
 import uvicorn
 import pyttsx3
 from vosk import Model, KaldiRecognizer
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import Response, RedirectResponse, FileResponse
+from fastapi.responses import (
+    Response,
+    RedirectResponse,
+    FileResponse,
+    PlainTextResponse,
+    JSONResponse,
+)
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 
@@ -47,7 +56,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-with open("config.json", "r", encoding="utf-8") as f:
+BASE_DIR = Path(__file__).resolve().parent
+
+with (BASE_DIR / "config.json").open("r", encoding="utf-8") as f:
     config = json.load(f)
 
 recent_queries = deque(maxlen=10)
@@ -55,17 +66,32 @@ last_request_stats = None
 
 options = config.get("options", {})
 
-MAX_HISTORY_MESSAGES = options.get("max_history_messages", 20)
+MAX_HISTORY_MESSAGES = max(
+    0, int(options.get("max_history_messages", 20))
+)
 KEEP_AUDIO_FILES = options.get("keep_audio_files", False)
-CONVERSATION_TIMEOUT_MINUTES = options.get(
-    "conversation_timeout_minutes", 30
+CONVERSATION_TIMEOUT_MINUTES = max(
+    1, int(options.get("conversation_timeout_minutes", 30))
 )
 FFMPEG_PATH = options.get("ffmpeg_path", "ffmpeg")
+
+MAX_AUDIO_BYTES = int(
+    options.get("max_audio_bytes", 20 * 1024 * 1024)
+)
+MAX_REQUEST_BYTES = int(
+    options.get(
+        "max_request_bytes",
+        MAX_AUDIO_BYTES + 1024 * 1024,
+    )
+)
 
 VOSK_MODEL_PATH = config.get("speech", {}).get(
     "vosk_model_path",
     "models/vosk-model-small-en-us-0.15",
 )
+
+if not os.path.isabs(VOSK_MODEL_PATH):
+    VOSK_MODEL_PATH = str(BASE_DIR / VOSK_MODEL_PATH)
 
 conversation_history = {}
 conversation_last_access = {}
@@ -85,6 +111,10 @@ def transcribe_audio_sync(audio_data: bytes) -> tuple[str, dict]:
     if not audio_data:
         return "", stats
 
+    if len(audio_data) > MAX_AUDIO_BYTES:
+        logger.warning("Audio payload exceeds configured size limit")
+        return "", stats
+
     if vosk_model is None:
         logger.warning("Vosk model is not loaded")
         return "", stats
@@ -92,8 +122,13 @@ def transcribe_audio_sync(audio_data: bytes) -> tuple[str, dict]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = uuid.uuid4().hex[:8]
 
-    input_file = f"audio_{timestamp}_{suffix}.speex"
-    wav_file = f"audio_{timestamp}_{suffix}.wav"
+    temp_dir = tempfile.gettempdir()
+    input_file = os.path.join(
+        temp_dir, f"svoice_{timestamp}_{suffix}.audio"
+    )
+    wav_file = os.path.join(
+        temp_dir, f"svoice_{timestamp}_{suffix}.wav"
+    )
 
     try:
         t0 = time.perf_counter()
@@ -102,7 +137,6 @@ def transcribe_audio_sync(audio_data: bytes) -> tuple[str, dict]:
             f.write(audio_data)
 
         stats["save_audio"] = time.perf_counter() - t0
-
         logger.info("Saved %d bytes of incoming audio", len(audio_data))
 
         t0 = time.perf_counter()
@@ -110,6 +144,9 @@ def transcribe_audio_sync(audio_data: bytes) -> tuple[str, dict]:
         result = subprocess.run(
             [
                 FFMPEG_PATH,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel", "error",
                 "-y",
                 "-i", input_file,
                 "-vn",
@@ -120,6 +157,7 @@ def transcribe_audio_sync(audio_data: bytes) -> tuple[str, dict]:
             ],
             capture_output=True,
             timeout=60,
+            check=False,
         )
 
         stats["ffmpeg_convert"] = time.perf_counter() - t0
@@ -147,10 +185,8 @@ def transcribe_audio_sync(audio_data: bytes) -> tuple[str, dict]:
 
             while True:
                 frames = wav.readframes(4000)
-
                 if not frames:
                     break
-
                 recognizer.AcceptWaveform(frames)
 
             result = json.loads(recognizer.FinalResult())
@@ -161,6 +197,10 @@ def transcribe_audio_sync(audio_data: bytes) -> tuple[str, dict]:
         logger.info("Transcription: %s", transcription)
 
         return transcription, stats
+
+    except subprocess.TimeoutExpired:
+        logger.warning("Audio conversion timed out")
+        return "", stats
 
     except Exception:
         logger.exception("Error processing incoming audio")
@@ -209,22 +249,21 @@ async def synthesize_speech(text: str, output_path: str):
 def clean_old_conversations():
     """Remove conversations that have expired."""
 
-    current_time = datetime.now()
-    timeout_seconds = CONVERSATION_TIMEOUT_MINUTES * 60
+    now = datetime.now()
+    timeout = timedelta(minutes=CONVERSATION_TIMEOUT_MINUTES)
 
-    expired_convs = [
+    expired = [
         conv_id
         for conv_id, last_access in conversation_last_access.items()
-        if (current_time - last_access).total_seconds()
-        > timeout_seconds
+        if now - last_access > timeout
     ]
 
-    for conv_id in expired_convs:
+    for conv_id in expired:
         conversation_history.pop(conv_id, None)
         conversation_last_access.pop(conv_id, None)
 
         logger.info(
-            "Cleaned up expired conversation: %s",
+            "Expired conversation removed: %s",
             conv_id[:8],
         )
 
@@ -232,19 +271,26 @@ def clean_old_conversations():
 def get_or_create_conversation(
     dialog_state: dict | None,
 ) -> tuple[str, list]:
-    """Get an existing conversation or create a new one."""
+    """Get a valid existing conversation or create a new one."""
 
     clean_old_conversations()
 
-    if dialog_state and "conversation_id" in dialog_state:
-        conv_id = dialog_state["conversation_id"]
+    conv_id = None
 
-        if conv_id in conversation_history:
-            conversation_last_access[conv_id] = datetime.now()
-            return conv_id, conversation_history[conv_id]
+    if isinstance(dialog_state, dict):
+        candidate = dialog_state.get("conversation_id")
+
+        if isinstance(candidate, str):
+            try:
+                conv_id = str(uuid.UUID(candidate))
+            except (ValueError, AttributeError):
+                conv_id = None
+
+    if conv_id and conv_id in conversation_history:
+        conversation_last_access[conv_id] = datetime.now()
+        return conv_id, conversation_history[conv_id]
 
     conv_id = str(uuid.uuid4())
-
     conversation_history[conv_id] = []
     conversation_last_access[conv_id] = datetime.now()
 
@@ -257,39 +303,73 @@ def add_to_conversation(
     assistant_text: str,
     tool_call: str = None,
 ):
-    """Add a turn to conversation history."""
+    """Append a turn while keeping history within configured limits."""
 
-    if conv_id not in conversation_history:
+    if MAX_HISTORY_MESSAGES <= 0:
         conversation_history[conv_id] = []
+        conversation_last_access[conv_id] = datetime.now()
+        return
 
-    conversation_history[conv_id].append({
+    history = conversation_history.setdefault(conv_id, [])
+
+    history.append({
         "role": "user",
         "content": user_text,
     })
 
     if tool_call:
-        conversation_history[conv_id].append({
+        history.append({
             "role": "tool",
             "content": tool_call,
         })
 
-    conversation_history[conv_id].append({
+    history.append({
         "role": "assistant",
         "content": assistant_text,
     })
 
-    if MAX_HISTORY_MESSAGES <= 0:
-        conversation_history[conv_id].clear()
-    elif len(conversation_history[conv_id]) > MAX_HISTORY_MESSAGES:
-        conversation_history[conv_id] = (
-            conversation_history[conv_id][-MAX_HISTORY_MESSAGES:]
-        )
+    while len(history) > MAX_HISTORY_MESSAGES:
+        history.pop(0)
+
+        while history and history[0].get("role") != "user":
+            history.pop(0)
 
     conversation_last_access[conv_id] = datetime.now()
 
 def normalize_text(text: str) -> str:
     """Normalize text for predictable command matching."""
-    return re.sub(r"\s+", " ", text.strip().lower())
+
+    text = unquote(str(text or ""))
+    text = text.strip().lower()
+    text = re.sub(r"\s+", " ", text)
+
+    text = re.sub(r"\bwhats\b", "what's", text)
+    text = re.sub(r"\bhows\b", "how's", text)
+    text = re.sub(r"\bwhos\b", "who's", text)
+    text = re.sub(r"\bthats\b", "that's", text)
+
+    return text
+
+
+def extract_command_argument(
+    text: str,
+    patterns: list,
+) -> str | None:
+    """Extract the first matching argument."""
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+
+        if match:
+            value = match.group(1).strip(" .,!?'\"")
+            return value or None
+
+    return None
+def normalize_text(text: str) -> str:
+    """Normalize text for predictable command matching."""
+    text = text.strip().lower()
+    text = text.replace("’", "'")
+    return re.sub(r"\s+", " ", text)
 
 
 def extract_command_argument(text: str, patterns: list) -> str | None:
@@ -314,9 +394,8 @@ PLEASANTRY_RESPONSES = {
     "whats_up": [
         "Not much! Just standing by to help you out.",
         "I'm all ears! What's up?",
-        "Just hanging out in your device, ready when you need me.",
         "Everything's running smoothly.",
-        "The usual: listening, learning, and ready to assist!",
+        "The usual: listening and ready to assist!",
     ],
     "greeting": [
         "Hello! It's great to hear from you.",
@@ -329,7 +408,6 @@ PLEASANTRY_RESPONSES = {
         "You're very welcome!",
         "Anytime! That's what I'm here for.",
         "Happy to help!",
-        "You're welcome!",
         "My pleasure!",
         "No problem at all!",
     ],
@@ -338,7 +416,6 @@ PLEASANTRY_RESPONSES = {
         "That's very kind of you to say!",
         "I'll take that as a five-star review!",
         "Thanks! I'll do my best to keep impressing you.",
-        "You're making me blush!",
     ],
     "apology": [
         "No worries at all!",
@@ -355,9 +432,8 @@ PLEASANTRY_RESPONSES = {
     ],
     "good_night": [
         "Good night! Sleep well.",
-        "Sweet dreams! I'll be here tomorrow.",
+        "Sweet dreams!",
         "Rest up and have a peaceful night.",
-        "Good night! I hope tomorrow is a great day for you.",
     ],
     "identity": [
         "I'm S Voice, your personal voice assistant. How can I help?",
@@ -429,12 +505,13 @@ TRIVIA_INTROS = [
     "Fun fact incoming!",
 ]
 
+
 def recognize_command(text: str) -> dict:
     """
-    Match recognized commands using deterministic rules.
+    Recognize S Voice commands using flexible, deterministic rules.
     No language model or remote API is used.
     """
-
+    
     original = text.strip()
     normalized = normalize_text(original)
 
@@ -442,9 +519,9 @@ def recognize_command(text: str) -> dict:
         return {"action": "regular"}
 
     app_name = extract_command_argument(original, [
-        r"^(?:please\s+)?open\s+(.+)$",
-        r"^(?:please\s+)?launch\s+(.+)$",
-        r"^(?:please\s+)?start\s+app\s+(.+)$",
+        r"^(?:please\s+)?(?:can you\s+)?open\s+(.+?)[?.!]*$",
+        r"^(?:please\s+)?(?:can you\s+)?launch\s+(.+?)[?.!]*$",
+        r"^(?:please\s+)?start\s+(?:the\s+)?app\s+(.+?)[?.!]*$",
     ])
 
     if app_name:
@@ -453,49 +530,79 @@ def recognize_command(text: str) -> dict:
             "",
             app_name,
             flags=re.IGNORECASE,
-        )
+        ).strip()
+
         return {
             "action": "open_app",
             "app_name": app_name,
         }
 
     timer_match = re.search(
-        r"\b(?:set|start)\s+(?:a\s+)?timer"
-        r"(?:\s+(?:for|of))?\s+"
+        r"\b(?:please\s+)?(?:set|start|create|make)\s+"
+        r"(?:me\s+)?(?:a\s+)?timer"
+        r"(?:\s+(?:for|of|lasting))?\s+"
         r"(\d+(?:\.\d+)?\s*"
         r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?))\b",
         normalized,
     )
 
+    if not timer_match:
+        timer_match = re.search(
+            r"\b(?:timer|countdown)\s+"
+            r"(?:for\s+)?(\d+(?:\.\d+)?\s*"
+            r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?))\b",
+            normalized,
+        )
+
     if timer_match:
         return {
             "action": "set_timer",
-            "canonical_time": timer_match.group(1),
+            "canonical_time": re.sub(
+                r"\s+", " ", timer_match.group(1)
+            ).strip(),
         }
 
     setting_match = re.search(
-        r"\b(?:turn|switch|set|enable|disable)\s+"
-        r"(.+?)\s+(on|off|enabled|disabled)\b",
+        r"\b(?:please\s+)?"
+        r"(?:turn|switch|set|enable|disable)\s+"
+        r"(?:(on|off)\s+)?"
+        r"(.+?)"
+        r"(?:\s+(on|off|enabled|disabled))?"
+        r"[?.!]*$",
         normalized,
     )
 
     if setting_match:
-        setting = setting_match.group(1).strip()
-        state = setting_match.group(2).upper()
+        prefix_state = setting_match.group(1)
+        setting_name = setting_match.group(2).strip()
+        suffix_state = setting_match.group(3)
 
-        if state == "ENABLED":
-            state = "ON"
-        elif state == "DISABLED":
-            state = "OFF"
+        state = suffix_state or prefix_state
 
-        return {
-            "action": "change_setting",
-            "setting_name": setting,
-            "state": state,
-        }
+        if state:
+            setting_name = re.sub(
+                r"^(?:the|my)\s+",
+                "",
+                setting_name,
+            ).strip()
+
+            state = state.upper()
+
+            if state == "ENABLED":
+                state = "ON"
+            elif state == "DISABLED":
+                state = "OFF"
+
+            if setting_name:
+                return {
+                    "action": "change_setting",
+                    "setting_name": setting_name,
+                    "state": state,
+                }
 
     if re.search(
-        r"\b(?:start|begin)\s+(?:a\s+)?"
+        r"\b(?:start|begin|make|create)\s+"
+        r"(?:a\s+)?(?:new\s+)?"
         r"(?:voice\s+)?record(?:ing)?\b",
         normalized,
     ):
@@ -511,9 +618,15 @@ def recognize_command(text: str) -> dict:
         }
 
     query = extract_command_argument(original, [
-        r"^(?:please\s+)?search\s+(?:the\s+web\s+)?for\s+(.+)$",
+        r"^(?:please\s+)?search\s+"
+        r"(?:(?:the\s+)?web\s+)?for\s+(.+)$",
         r"^(?:please\s+)?look\s+up\s+(.+)$",
-        r"^(?:please\s+)?find\s+information\s+about\s+(.+)$",
+        r"^(?:please\s+)?find\s+"
+        r"(?:information|info|details|results)\s+about\s+(.+)$",
+        r"^(?:please\s+)?tell\s+me\s+about\s+(.+)$",
+        r"^(?:please\s+)?what\s+is\s+(.+)$",
+        r"^(?:please\s+)?who\s+is\s+(.+)$",
+        r"^(?:please\s+)?where\s+is\s+(.+)$",
     ])
 
     if query:
@@ -523,20 +636,33 @@ def recognize_command(text: str) -> dict:
         }
 
     if re.fullmatch(
-        r"(?:please\s+)?(?:search|web search|open search)"
-        r"(?: the web)?",
+        r"(?:please\s+)?"
+        r"(?:search|web search|open search|search the web|"
+        r"search online|look something up)"
+        r"[?.! ]*",
         normalized,
     ):
         return {"action": "web_search_prompt"}
 
-    if re.search(
-        r"\b(?:play|resume|pause|stop|skip|next|previous)\b",
-        normalized,
-    ) and re.search(
+    music_context = re.search(
         r"\b(?:music|song|track|album|playlist|artist|"
-        r"spotify|youtube|audio|play|pause|stop|skip|"
-        r"next|previous|resume)\b",
+        r"spotify|youtube|audio|player|playback)\b",
         normalized,
+    )
+
+    music_action = re.search(
+        r"\b(?:play|resume|pause|stop|skip|next|previous|"
+        r"continue|restart|shuffle|repeat)\b",
+        normalized,
+    )
+
+    if music_action and (
+        music_context
+        or re.fullmatch(
+            r".*\b(?:pause|stop|resume|continue|skip|"
+            r"next|previous|restart)\b.*",
+            normalized,
+        )
     ):
         play_type = "PLAY"
 
@@ -546,16 +672,26 @@ def recognize_command(text: str) -> dict:
             play_type = "STOP"
         elif re.search(r"\b(?:skip|next)\b", normalized):
             play_type = "NEXT"
-        elif re.search(r"\bprevious\b|\bgo back\b", normalized):
+        elif re.search(r"\b(?:previous|go back)\b", normalized):
             play_type = "PREVIOUS"
+        elif re.search(r"\b(?:resume|continue)\b", normalized):
+            play_type = "PLAY"
 
         name = extract_command_argument(original, [
             r"\bplay\s+music\s+by\s+(.+)$",
+            r"\bplay\s+(?:the\s+)?song\s+(.+)$",
+            r"\bplay\s+(?:the\s+)?track\s+(.+)$",
             r"\bplay\s+(.+)$",
         ])
 
         if name and normalize_text(name) in {
-            "music", "some music", "a song", "music please"
+            "music",
+            "some music",
+            "a song",
+            "music please",
+            "some songs",
+            "something",
+            "something good",
         }:
             name = None
 
@@ -565,12 +701,17 @@ def recognize_command(text: str) -> dict:
             "name": name,
         }
 
-    if re.search(r"\b(?:sing|singing)\b", normalized):
-        return {"action": "chatbot_sing"}
-    
     if re.search(
-        r"\b(?:trivia|fun fact|random fact|interesting fact|"
-        r"did you know|surprise me|something interesting)\b",
+        r"\b(?:sing|singing|sing me|"
+        r"sing a song|can you sing)\b",
+        normalized,
+    ):
+        return {"action": "chatbot_sing"}
+
+    if re.search(
+        r"\b(?:trivia|fun facts?|random facts?|"
+        r"interesting facts?|did you know|surprise me|"
+        r"something interesting|tell me a fact)\b",
         normalized,
     ):
         return {
@@ -581,165 +722,95 @@ def recognize_command(text: str) -> dict:
             ),
         }
 
-    if re.fullmatch(
-        r"(?:"
-        r"how are you(?: doing)?"
-        r"|how have you been"
-        r"|how are things"
-        r"|how is it going"
-        r"|how's it going"
-        r"|hows it going"
-        r"|are you doing (?:okay|ok|well|good|fine)"
-        r"|are you alright"
-        r"|are you all right"
-        r"|are you having a good day"
-        r"|how do you feel"
-        r")[?.!, ]*",
-        normalized,
-    ):
-        return {
-            "action": "fixed",
-            "response": random.choice(
-                PLEASANTRY_RESPONSES["how_are_you"]
-            ),
-        }
+    conversational_patterns = [
+        (
+            r"(?:how are you(?: doing)?|how have you been|"
+            r"how are things|how is it going|how's it going|"
+            r"hows it going|are you doing (?:okay|ok|well|good|fine)|"
+            r"are you alright|are you all right|"
+            r"are you having a good day|how do you feel)",
+            "how_are_you",
+        ),
+        (
+            r"(?:what's up|whats up|what is up|"
+            r"what's happening|whats happening|"
+            r"how's everything|hows everything|"
+            r"what are you up to|what's going on|"
+            r"whats going on)",
+            "whats_up",
+        ),
+        (
+            r"(?:who are you|what are you|"
+            r"what is your name|what's your name|"
+            r"whats your name|do you know who you are|"
+            r"are you s voice)",
+            "identity",
+        ),
+        (
+            r"(?:what can you do|what can you help me with|"
+            r"what are your features|how can you help me|"
+            r"what commands do you know|"
+            r"what can you help with|what are your capabilities)",
+            "capabilities",
+        ),
+        (
+            r"(?:you're awesome|youre awesome|you are awesome|"
+            r"you're amazing|youre amazing|you are amazing|"
+            r"you're great|youre great|you are great|"
+            r"you're the best|youre the best|you are the best|"
+            r"good job|well done|i like you)",
+            "compliment",
+        ),
+        (
+            r"(?:sorry|i'm sorry|im sorry|"
+            r"my apologies|i apologize)",
+            "apology",
+        ),
+        (
+            r"(?:good night|goodnight|nighty night|"
+            r"sleep well|sweet dreams)",
+            "good_night",
+        ),
+        (
+            r"(?:goodbye|good bye|bye|bye bye|"
+            r"see you|see you later|talk to you later|"
+            r"catch you later|take care)",
+            "goodbye",
+        ),
+        (
+            r"(?:hi|hello|hey|hey there|"
+            r"good morning|good afternoon|good evening)",
+            "greeting",
+        ),
+        (
+            r"(?:thanks|thank you|thanks a lot|"
+            r"thank you very much|much appreciated)",
+            "thanks",
+        ),
+    ]
+
+    for pattern, response_group in conversational_patterns:
+        if re.fullmatch(pattern + r"[?.!, ]*", normalized):
+            return {
+                "action": "fixed",
+                "response": random.choice(
+                    PLEASANTRY_RESPONSES[response_group]
+                ),
+            }
 
     if re.fullmatch(
-        r"(?:what's up|whats up|what is up|"
-        r"what's happening|whats happening|"
-        r"how's everything|hows everything|"
-        r"what are you up to)[?.!, ]*",
+        r"(?:what time is it|"
+        r"tell me the time|"
+        r"what's the time|"
+        r"whats the time|"
+        r"current time|"
+        r"what is the current time)"
+        r"[?.! ]*",
         normalized,
     ):
-        return {
-            "action": "fixed",
-            "response": random.choice(
-                PLEASANTRY_RESPONSES["whats_up"]
-            ),
-        }
-
-    if re.fullmatch(
-        r"(?:"
-        r"who are you"
-        r"|what are you"
-        r"|what is your name"
-        r"|what's your name"
-        r"|whats your name"
-        r"|do you know who you are"
-        r")[?.!, ]*",
-        normalized,
-    ):
-        return {
-            "action": "fixed",
-            "response": random.choice(
-                PLEASANTRY_RESPONSES["identity"]
-            ),
-        }
-
-    if re.fullmatch(
-        r"(?:"
-        r"what can you do"
-        r"|what can you help me with"
-        r"|what are your features"
-        r"|how can you help me"
-        r"|what commands do you know"
-        r")[?.!, ]*",
-        normalized,
-    ):
-        return {
-            "action": "fixed",
-            "response": random.choice(
-                PLEASANTRY_RESPONSES["capabilities"]
-            ),
-        }
-
-    if re.fullmatch(
-        r"(?:"
-        r"you're awesome|youre awesome"
-        r"|you are awesome"
-        r"|you're amazing|youre amazing"
-        r"|you are amazing"
-        r"|you're great|youre great"
-        r"|you are great"
-        r"|you're the best|youre the best"
-        r"|you are the best"
-        r"|good job"
-        r"|well done"
-        r"|i like you"
-        r")[!. ]*",
-        normalized,
-    ):
-        return {
-            "action": "fixed",
-            "response": random.choice(
-                PLEASANTRY_RESPONSES["compliment"]
-            ),
-        }
-
-    if re.fullmatch(
-        r"(?:"
-        r"sorry"
-        r"|i'm sorry|im sorry"
-        r"|my apologies"
-        r"|i apologize"
-        r")[!. ]*",
-        normalized,
-    ):
-        return {
-            "action": "fixed",
-            "response": random.choice(
-                PLEASANTRY_RESPONSES["apology"]
-            ),
-        }
-
-    if re.fullmatch(
-        r"(?:good night|goodnight|nighty night|"
-        r"sleep well|sweet dreams)[!. ]*",
-        normalized,
-    ):
-        return {
-            "action": "fixed",
-            "response": random.choice(
-                PLEASANTRY_RESPONSES["good_night"]
-            ),
-        }
-
-    if re.fullmatch(
-        r"(?:goodbye|good bye|bye|bye bye|"
-        r"see you|see you later|talk to you later|"
-        r"catch you later|take care)[!. ]*",
-        normalized,
-    ):
-        return {
-            "action": "fixed",
-            "response": random.choice(
-                PLEASANTRY_RESPONSES["goodbye"]
-            ),
-        }
-
-    if re.fullmatch(
-        r"(?:hi|hello|hey|good morning|good afternoon|good evening)[!. ]*",
-        normalized,
-    ):
-        return {
-            "action": "fixed",
-            "response": "Hello! How can I help?",
-        }
-
-    if re.fullmatch(
-        r"(?:thanks|thank you|thanks a lot)[!. ]*",
-        normalized,
-    ):
-        return {
-            "action": "fixed",
-            "response": "You're welcome!",
-        }
-
-    if re.fullmatch(
-        r"(?:what time is it|tell me the time|current time)[?. ]*",
-        normalized,
-    ):
-        current_time = datetime.now().strftime("%I:%M %p").lstrip("0")
+        current_time = datetime.now().strftime(
+            "%I:%M %p"
+        ).lstrip("0")
 
         return {
             "action": "fixed",
@@ -747,7 +818,11 @@ def recognize_command(text: str) -> dict:
         }
 
     if re.fullmatch(
-        r"(?:what is the date|what's the date|today's date)[?. ]*",
+        r"(?:what is the date|what's the date|"
+        r"whats the date|what is today's date|"
+        r"what's today's date|today's date|"
+        r"what day is it|what is the day)"
+        r"[?.! ]*",
         normalized,
     ):
         return {
@@ -758,6 +833,19 @@ def recognize_command(text: str) -> dict:
         }
 
     return {"action": "regular"}
+
+LEGACY_SVOICE_HOSTS = {
+    "samsungbuiasr.vlingo.com",
+    "samsungbuitts.vlingo.com",
+    "samsungbuilocalsearch.vlingo.com",
+}
+
+SVOICE_ROUTES = {
+    "/voicepad/sr",
+    "/tts",
+    "/dash",
+    "/dash/tools",
+}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -777,7 +865,8 @@ async def lifespan(app: FastAPI):
 
         version_line = (
             result.stdout.splitlines()[0]
-            if result.stdout else "unknown version"
+            if result.stdout
+            else "unknown version"
         )
 
         logger.info("ffmpeg found: %s", version_line)
@@ -795,7 +884,10 @@ async def lifespan(app: FastAPI):
         )
 
     try:
-        logger.info("Loading Vosk model from %s", VOSK_MODEL_PATH)
+        logger.info(
+            "Loading Vosk model from %s",
+            VOSK_MODEL_PATH,
+        )
 
         vosk_model = await asyncio.to_thread(
             Model,
@@ -817,29 +909,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@app.middleware("http")
-async def normalize_legacy_request_path(request: Request, call_next):
-    """Normalize legacy clients sending encoded absolute URLs."""
-    scope = request.scope
-    original_path = scope.get("path", "")
-    decoded_path = unquote(original_path)
-
-    if decoded_path.startswith(("http://", "https://")):
-        parsed = urlsplit(decoded_path)
-
-        if parsed.path.startswith("/"):
-            logger.info(
-                "Normalized legacy request path: %s -> %s",
-                original_path,
-                parsed.path,
-            )
-            scope["path"] = parsed.path
-            scope["raw_path"] = parsed.path.encode("utf-8")
-
-            if parsed.query:
-                scope["query_string"] = parsed.query.encode("utf-8")
-
-    return await call_next(request)
+templates = Jinja2Templates(directory="templates")
 
 app.mount(
     "/static",
@@ -847,7 +917,89 @@ app.mount(
     name="static",
 )
 
-templates = Jinja2Templates(directory="templates")
+@app.middleware("http")
+async def normalize_legacy_request_path(
+    request: Request,
+    call_next,
+):
+    """
+    Handle legacy S Voice clients without rewriting arbitrary
+    external URLs into local paths.
+
+    The Host header identifies the virtual host the client
+    intended to contact. Requests for unrelated hosts are not
+    silently rewritten into S Voice endpoints.
+    """
+    scope = request.scope
+
+    original_path = scope.get("path", "/")
+    host_header = request.headers.get("host", "")
+    host = host_header.split(":", 1)[0].strip().lower()
+
+    decoded_path = unquote(original_path)
+
+    if decoded_path.startswith(("http://", "https://")):
+        parsed = urlsplit(decoded_path)
+        destination_host = (parsed.hostname or "").lower()
+        destination_path = parsed.path or "/"
+
+        if destination_host in LEGACY_SVOICE_HOSTS:
+            if destination_path in SVOICE_ROUTES:
+                logger.info(
+                    "Accepted legacy S Voice URL: %s%s",
+                    destination_host,
+                    destination_path,
+                )
+
+                scope["path"] = destination_path
+                scope["raw_path"] = destination_path.encode(
+                    "utf-8"
+                )
+
+                if parsed.query:
+                    scope["query_string"] = parsed.query.encode(
+                        "utf-8"
+                    )
+            else:
+                logger.info(
+                    "Legacy S Voice host requested unsupported "
+                    "path: host=%s path=%s",
+                    destination_host,
+                    destination_path,
+                )
+
+        else:
+            logger.debug(
+                "Leaving unrelated absolute URL untouched: "
+                "host=%s path=%s",
+                destination_host,
+                destination_path,
+            )
+
+    response = await call_next(request)
+    return response
+
+@app.get("/")
+async def root():
+    """Provide a simple landing page for the local server."""
+    return PlainTextResponse(
+        "S Voice revival server is running.\n"
+        "Assistant endpoint: POST /voicepad/sr\n"
+        "Text-to-speech: GET /tts?text=Hello\n"
+        "Dashboard: GET /dash\n"
+    )
+
+
+@app.get("/health")
+async def health():
+    """Basic server health check."""
+    return {
+        "status": "ok",
+        "service": "S Voice revival server",
+        "speech_recognition": (
+            "ready" if vosk_model is not None else "unavailable"
+        ),
+    }
 
 @app.post("/voicepad/sr")
 async def asr_endpoint(request: Request):
@@ -864,12 +1016,12 @@ async def asr_endpoint(request: Request):
 
     dialog_state = extract_dialog_state(body)
 
-    if dialog_state:
-        logger.info("Dialog state received: %s", dialog_state)
-    else:
-        logger.info("No dialog state, new conversation")
+    if not isinstance(dialog_state, dict):
+        dialog_state = {}
 
-    conv_id, history = get_or_create_conversation(dialog_state)
+    conv_id, history = get_or_create_conversation(
+        dialog_state
+    )
 
     logger.info(
         "Conversation: %s (history: %d messages)",
@@ -879,7 +1031,10 @@ async def asr_endpoint(request: Request):
 
     audio_data = extract_audio_data(body)
 
-    transcription, audio_stats = await transcribe_audio(audio_data)
+    transcription, audio_stats = await transcribe_audio(
+        audio_data
+    )
+
     stats.update(audio_stats)
 
     if not transcription:
@@ -891,12 +1046,14 @@ async def asr_endpoint(request: Request):
     if transcription:
         recent_queries.append(transcription)
     else:
-        logger.warning("No audio or text data found in request")
+        logger.warning(
+            "No audio or text data found in request"
+        )
 
-    turn = (
-        dialog_state.get("turn", 0) + 1
-        if dialog_state else 1
-    )
+    try:
+        turn = int(dialog_state.get("turn", 0)) + 1
+    except (ValueError, TypeError):
+        turn = 1
 
     new_dialog_state = {
         "turn": turn,
@@ -905,108 +1062,159 @@ async def asr_endpoint(request: Request):
 
     t0 = time.perf_counter()
     command = recognize_command(transcription)
-    stats["command_recognition"] = time.perf_counter() - t0
+    stats["command_recognition"] = (
+        time.perf_counter() - t0
+    )
 
-    action = command["action"]
+    action = command.get("action", "regular")
+
     logger.info("Recognized command: %s", action)
+
     tool_used = None
 
-    if action == "open_app":
-        app_name = command["app_name"]
+    try:
+        if action == "open_app":
+            app_name = command["app_name"]
 
-        xml = generate_open_app_response(
-            transcription, app_name, new_dialog_state
+            xml = generate_open_app_response(
+                transcription,
+                app_name,
+                new_dialog_state,
+            )
+
+            final_response_text = f"Opening {app_name}"
+            tool_used = f"open_app({app_name})"
+
+        elif action == "set_timer":
+            canonical_time = command["canonical_time"]
+
+            xml = generate_set_timer_response(
+                transcription,
+                canonical_time,
+                new_dialog_state,
+            )
+
+            final_response_text = (
+                f"Setting timer for {canonical_time}"
+            )
+
+            tool_used = f"set_timer({canonical_time})"
+
+        elif action == "change_setting":
+            setting_name = command["setting_name"]
+            state = command["state"]
+
+            xml = generate_setting_change_response(
+                transcription,
+                setting_name,
+                state,
+                new_dialog_state,
+            )
+
+            final_response_text = (
+                f"Changing {setting_name} to {state}"
+            )
+
+            tool_used = (
+                f"change_setting({setting_name}, {state})"
+            )
+
+        elif action == "record_voice":
+            title = command.get("title")
+
+            xml = generate_record_voice_response(
+                transcription,
+                title,
+                new_dialog_state,
+            )
+
+            final_response_text = "Starting voice recording"
+            tool_used = f"record_voice({title or ''})"
+
+        elif action == "web_search":
+            query = command["query"]
+
+            xml = generate_web_search_response(
+                transcription,
+                query,
+                new_dialog_state,
+            )
+
+            final_response_text = f"Searching for {query}"
+            tool_used = f"web_search({query})"
+
+        elif action == "web_search_prompt":
+            xml = generate_web_search_prompt_response(
+                transcription,
+                transcription,
+                new_dialog_state,
+            )
+
+            final_response_text = "Here's a search option"
+            tool_used = "web_search_prompt()"
+
+        elif action == "play_music":
+            play_type = command.get("play_type", "PLAY")
+            name = command.get("name")
+
+            xml = generate_play_music_response(
+                transcription,
+                play_type,
+                name,
+                new_dialog_state,
+            )
+
+            final_response_text = (
+                f"Music: {play_type}"
+                + (f" {name}" if name else "")
+            )
+
+            tool_used = (
+                f"play_music({play_type}, {name})"
+                if name
+                else f"play_music({play_type})"
+            )
+
+        elif action == "chatbot_sing":
+            xml = generate_chatbot_sing_response(
+                transcription,
+                new_dialog_state,
+            )
+
+            final_response_text = "Singing"
+            tool_used = "chatbot_sing()"
+
+        elif action == "fixed":
+            final_response_text = command["response"]
+
+            xml = generate_regular_response(
+                transcription,
+                final_response_text,
+                new_dialog_state,
+            )
+
+        else:
+            final_response_text = (
+                "I'm not sure I understood that. You can ask me "
+                "to open an app, set a timer, change a setting, "
+                "play music, search the web, or tell you a fact."
+            )
+
+            xml = generate_regular_response(
+                transcription,
+                final_response_text,
+                new_dialog_state,
+            )
+
+    except Exception:
+        logger.exception(
+            "Failed to generate response for action %s",
+            action,
         )
-        final_response_text = f"Opening {app_name}"
-        tool_used = f"open_app({app_name})"
 
-    elif action == "set_timer":
-        canonical_time = command["canonical_time"]
-
-        xml = generate_set_timer_response(
-            transcription, canonical_time, new_dialog_state
-        )
-        final_response_text = f"Setting timer for {canonical_time}"
-        tool_used = f"set_timer({canonical_time})"
-
-    elif action == "change_setting":
-        setting_name = command["setting_name"]
-        state = command["state"]
-
-        xml = generate_setting_change_response(
-            transcription,
-            setting_name,
-            state,
-            new_dialog_state,
-        )
         final_response_text = (
-            f"Changing {setting_name} to {state}"
-        )
-        tool_used = f"change_setting({setting_name}, {state})"
-
-    elif action == "record_voice":
-        title = command.get("title")
-
-        xml = generate_record_voice_response(
-            transcription, title, new_dialog_state
-        )
-        final_response_text = "Starting voice recording"
-        tool_used = f"record_voice({title or ''})"
-
-    elif action == "web_search":
-        query = command["query"]
-
-        xml = generate_web_search_response(
-            transcription, query, new_dialog_state
-        )
-        final_response_text = f"Searching for {query}"
-        tool_used = f"web_search({query})"
-
-    elif action == "web_search_prompt":
-        xml = generate_web_search_prompt_response(
-            transcription, transcription, new_dialog_state
-        )
-        final_response_text = "Here's a search option"
-        tool_used = "web_search_prompt()"
-
-    elif action == "play_music":
-        play_type = command.get("play_type", "PLAY")
-        name = command.get("name")
-
-        xml = generate_play_music_response(
-            transcription, play_type, name, new_dialog_state
-        )
-
-        final_response_text = (
-            f"Music: {play_type}"
-            + (f" {name}" if name else "")
-        )
-        tool_used = (
-            f"play_music({play_type}, {name})"
-            if name else f"play_music({play_type})"
-        )
-
-    elif action == "chatbot_sing":
-        xml = generate_chatbot_sing_response(
-            transcription, new_dialog_state
-        )
-        final_response_text = "Singing"
-        tool_used = "chatbot_sing()"
-
-    elif action == "fixed":
-        final_response_text = command["response"]
-
-        xml = generate_regular_response(
-            transcription,
-            final_response_text,
-            new_dialog_state,
-        )
-
-    else:
-        final_response_text = (
-            "Sorry, I couldn't match that to a supported command. "
-            "Try opening an app, setting a timer, changing a "
-            "setting, controlling music, or searching the web."
+            "Sorry, something went wrong while processing "
+            "that request. Please try again."
         )
 
         xml = generate_regular_response(
@@ -1028,9 +1236,15 @@ async def asr_endpoint(request: Request):
     stats["total"] = time.perf_counter() - started
     last_request_stats = stats
 
-    logger.info("Full Response XML: %s", xml)
+    logger.info(
+        "Request completed in %.3f seconds",
+        stats["total"],
+    )
 
-    return Response(content=xml, media_type="text/xml")
+    return Response(
+        content=xml,
+        media_type="text/xml",
+    )
 
 @app.get("/tts")
 async def tts_endpoint(text: str):
@@ -1052,13 +1266,16 @@ async def tts_endpoint(text: str):
 
     fd, output_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
-    os.remove(output_path)
 
     try:
+        os.remove(output_path)
+
         await synthesize_speech(text, output_path)
 
         if not os.path.isfile(output_path):
-            raise RuntimeError("TTS did not create an audio file")
+            raise RuntimeError(
+                "TTS did not create an audio file"
+            )
 
         return FileResponse(
             output_path,
@@ -1066,6 +1283,11 @@ async def tts_endpoint(text: str):
             filename="speech.wav",
             background=None,
         )
+
+    except HTTPException:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        raise
 
     except Exception:
         if os.path.exists(output_path):
@@ -1096,6 +1318,7 @@ async def dashboard(request: Request):
 
 @app.post("/dash/tools")
 async def update_tools(request: Request):
+    """Update enabled tool settings from the dashboard."""
 
     form_data = await request.form()
     enabled_tools = form_data.getlist("tools")
@@ -1119,11 +1342,39 @@ async def update_tools(request: Request):
         status_code=303,
     )
 
+@app.exception_handler(404)
+async def not_found_handler(
+    request: Request,
+    exc: HTTPException,
+):
+    """Return a clear 404 without pretending every URL is S Voice."""
+
+    path = request.url.path
+    path = unquote(path);
+
+    logger.info(
+        "Route not found: method=%s path=%s host=%s",
+        request.method,
+        path,
+        request.headers.get("host", ""),
+    )
+
+    return PlainTextResponse(
+        f"Not found: {path}\n"
+        "This path is not registered on the S Voice server.",
+        status_code=404,
+    )
+
 if __name__ == "__main__":
     bind_host = config.get("server", {}).get(
-        "bind", "0.0.0.0"
+        "bind",
+        "0.0.0.0",
     )
-    port = config.get("server", {}).get("port", 8000)
+
+    port = config.get("server", {}).get(
+        "port",
+        8000,
+    )
 
     uvicorn.run(
         "main:app",
